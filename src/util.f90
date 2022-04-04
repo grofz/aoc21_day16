@@ -1,8 +1,8 @@
   module utils
     implicit none
-
     integer, parameter :: LK = selected_int_kind(1)
     integer, parameter :: I8 = selected_int_kind(18)
+    integer, parameter :: MAX_BIT_SIZE = 64 ! I8 is 64bit
 
     type bitstore_t
       logical(LK), allocatable :: store(:)
@@ -16,32 +16,161 @@
 
 
     type packet_t
-      integer :: ver   ! version
-      integer :: id    ! id
-      integer :: ilab  ! 1 or 0  ! TODO make logical
-      integer :: num   ! number of subpackets
-      integer :: size  ! size in bits
-      integer(I8) :: val
-      !logical(LK), allocatable :: raw(:)
+      integer :: ver      ! version
+      integer :: id       ! id (4=value else=operator)
+      integer(I8) :: val  ! value
+      logical(LK) :: isn  ! .true. -> num represents no. of subpackets
+      integer :: num      ! no. of sub-packets / bits in sub-packets
+      integer :: size     ! size in bits
+      integer, allocatable :: mem(:) ! list of sub-packets
     end type
 
   contains
+    recursive subroutine evalsubpackets(myid, arr, val)
+      type(packet_t), intent(inout) :: arr(:)
+      integer, intent(in) :: myid
+      integer(I8), intent(out) :: val
+
+      integer(i8) :: val1, val2
+      integer :: i
+
+      ! If packet is "literal value", just return the value
+      if (arr(myid) % id == 4) then
+        val = arr(myid) % val
+        return
+      endif
+
+      ! If operator is ">", "<", "=="
+      if (arr(myid) % id > 4) then
+        if (size(arr(myid) % mem) /= 2) &
+            error stop 'relational operator does not have two sub-packets'
+        call evalsubpackets(arr(myid) % mem(1), arr,  val1)
+        call evalsubpackets(arr(myid) % mem(2), arr, val2)
+        val = 0
+        select case(arr(myid) % id)
+        case(5) ! ">"
+          if (val1 > val2) val = 1
+        case(6) ! "<'
+          if (val1 < val2) val = 1
+        case(7) ! "=="
+          if (val1 == val2) val = 1
+        case default
+          error stop 'invalid id'
+        end select
+        arr(myid) % val = val
+        return
+      endif
+
+      ! Operator is sum, prod, min, max
+      select case(arr(myid)%id)
+      case(0) ! sum
+        val = 0
+      case(1) ! product
+        val = 1
+      case(2) ! min
+        val = huge(val)
+      case(3) ! max
+        val = -huge(val)
+      case default
+      end select
+      do i = 1, size(arr(myid) % mem)
+        call evalsubpackets(arr(myid) % mem(i), arr, val1)
+        select case(arr(myid)%id)
+        case(0) ! sum
+          val = val + val1
+        case(1) ! product
+          val = val * val1
+        case(2) ! min
+          val = min(val, val1)
+        case(3) ! max
+          val = max(val, val1)
+        end select
+      enddo
+      arr(myid) % val = val
+    end subroutine evalsubpackets
+
+
+
+    recursive subroutine findsubpackets(myid, arr, lastid, nbits)
+      integer, intent(in) :: myid
+      type(packet_t), intent(inout) :: arr(:)
+      integer, intent(out) :: lastid, nbits
+
+      integer :: nbits0, nsubpackets0, lastid1, nbits1
+      if (myid > size(arr)) &
+          error stop 'out of array bounds'
+
+      allocate(arr(myid) % mem(0))
+      lastid = myid
+      nbits = arr(myid) % size
+      if (arr(myid) % id == 4) return
+
+      ! packet is an operator
+      nbits0 = 0
+      nsubpackets0 = 0
+      do
+        ! continue unless all required subpackets received
+        if (arr(myid) % isn) then
+          if (nsubpackets0 == arr(myid) % num) exit
+          if (nsubpackets0 > arr(myid) % num) &
+              error stop 'find subpackets error'
+        
+        else
+          if (nbits0 == arr(myid) % num) exit
+          if (nbits0 > arr(myid) % num) &
+              error stop 'find subpackets error - overflow'
+        
+        endif
+
+        arr(myid) % mem = [arr(myid) % mem, lastid+1]
+        call findsubpackets(lastid+1, arr, lastid1, nbits1)
+        lastid = lastid1
+        nbits0 = nbits0 + nbits1
+        nsubpackets0 = nsubpackets0 + 1
+      enddo
+      nbits = nbits + nbits0
+    end subroutine findsubpackets
+
+
+
+    subroutine printsubpackets(arr)
+      type(packet_t), intent(in) :: arr(:)
+      integer :: i
+
+      do i = 1, size(arr)
+      if (arr(i) % id == 4) then
+        write(*, '(i4,a,i1,a,i0,a,i0,a)', advance='no') i, &
+        ' V', arr(i)%ver, ' value = ', arr(i)%val, &
+        ' (', arr(i)%size,'b)    '
+      else
+        write(*, '(i4,a,i1,a,i1,a,l1,a,i0,a,i0,a,i0,a)', advance='no') i, &
+        ' V', arr(i)%ver,' [', arr(i)%id,']  ', arr(i)%isn,'=', arr(i)%num, &
+        ' (', arr(i)%size,'b)   value = {', arr(i)%val,'}   '
+      endif
+      if (size(arr(i) % mem) > 0 .and. allocated(arr(i)%mem)) then
+        write(*,'(20(i0,1x))') arr(i) % mem
+      else
+        write(*,'(a)') 'no subpackets'
+      endif
+      enddo
+    end subroutine printsubpackets
+
+
 
     subroutine buypacket(packet, store)
       type(packet_t), intent(out) :: packet
       type(bitstore_t), intent(inout) :: store
 
       logical(LK), allocatable :: tmp(:), half(:), literal(:)
-      logical :: is_ok
       integer :: ibeg, nhalf
 
       ibeg = store % ibeg
 
       ! try to read packet's head
       if (store % canget(6)) then
-         call store % get(3, tmp, is_ok)
+         call store % get(3, tmp)
          packet % ver = bits2int(tmp)
-         call store % get(3, tmp, is_ok)     
+         call store % get(3, tmp)     
          packet % id = bits2int(tmp)
       else
   print *, 'buypacket: nothing in store '
@@ -50,54 +179,36 @@
       endif
 
       select case (packet % id) 
-      case(4) ! literal value
+      case(4) ! packet is "literal value"
         allocate(literal(0))
         nhalf = 0
         do
-          call store % get(1, tmp, is_ok)
-          call store % get(4, half, is_ok)
+          call store % get(1, tmp)
+          call store % get(4, half)
           literal = [literal, half]
           nhalf = nhalf + 1
           if (.not. tmp(1)) exit
         enddo
-        if (nhalf > 16) error stop '8 byte integer overflow'
         packet % val = bits2int(literal)
+        packet % num = -1
 
-      case default ! sub-packets
-        call store % get(1, tmp, is_ok)
+      case default ! packet is "operator"
+        call store % get(1, tmp)
         if (tmp(1)) then 
           ! next 11 bits represent number of subpackets
-          packet % ilab = 1
-          call store % get(11, tmp, is_ok)
-          packet % num = bits2int(tmp)
-
+          packet % isn = .true.
+          call store % get(11, tmp)
         else 
           ! next 15 bits represent total length of bits in subpackets
-          packet % ilab = 0
-          call store % get(15, tmp, is_ok)
-          packet % num = bits2int(tmp)
+          packet % isn = .false.
+          call store % get(15, tmp)
         endif
+        packet % val = -1
+        packet % num = bits2int(tmp)
       end select
       packet % size = store % ibeg - ibeg
 
-      if (packet % id == 4) then
-        print '(a,i1,a,i0,a,i0,a)', &
-        'V', packet%ver, ' value = ', packet%val, &
-        ' (', packet%size,'b)'
-      else
-        print '(a,i1,a,i1,a,i1,a,i0,a,i0,a)', &
-        'V', packet%ver,' [', packet%id,']  ', packet%ilab,'=', packet%num, &
-        ' (', packet%size,'b)'
-      endif
     end subroutine
-
-
-
-    logical function bitstore_canget(this, n)
-      class(bitstore_t), intent(in) :: this
-      integer, intent(in) :: n
-      bitstore_canget = this % ibeg + n - 1 <= this % iend
-    end function
 
 
 
@@ -147,27 +258,28 @@
 
 
 
-    subroutine bitstore_get(this, n, bits, is_success)
+    subroutine bitstore_get(this, n, bits)
       class(bitstore_t), intent(inout) :: this
       integer, intent(in) :: n
       logical(LK), allocatable, intent(out) :: bits(:)
-      logical, intent(out) :: is_success
  !
- ! Get "n" bits from the store. Empty array given if requesting more bits
- ! than in is stored.
+ ! Get "n" bits from the store. "canget" can be used to verify that
+ ! bits are in store.
  !
-      is_success = .true.
-      if (this % ibeg + n - 1 > this % iend) is_success = .false.
+      if (this % ibeg + n - 1 > this % iend) &
+          error stop 'bitstore_get: requested more than available'
+      allocate(bits(n))
+      bits = this % store(this % ibeg : this % ibeg + n - 1)
+      this % ibeg = this % ibeg + n
+    end subroutine bitstore_get
 
-      if (is_success) then
-        allocate(bits(n))
-        bits = this % store(this % ibeg : this % ibeg + n - 1)
-        this % ibeg = this % ibeg + n
-      else
-        allocate(bits(0))
-        return
-      endif
-    end subroutine
+
+
+    logical function bitstore_canget(this, n)
+      class(bitstore_t), intent(in) :: this
+      integer, intent(in) :: n
+      bitstore_canget = this % ibeg + n - 1 <= this % iend
+    end function
 
 
 
@@ -203,12 +315,13 @@
 
       integer :: i
 
+      if (size(bits) > MAX_BIT_SIZE) &
+          error stop 'bits2int: integer may overflow'
+
       int = 0
       do i = 1, size(bits)
         if (bits(i)) int = int + 2_I8**(size(bits)-i)
       enddo
     end function
-
-
 
   end module utils

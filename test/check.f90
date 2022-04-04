@@ -3,7 +3,8 @@
     implicit none
 
     character(len=:), allocatable ::  input_file
-    integer :: i
+    integer :: i, j
+    integer(I8) :: val
     type(bitstore_t) :: bitstore
     type(packet_t)   :: one_packet
     type(packet_t), allocatable :: packets(:)
@@ -46,11 +47,16 @@
 
       i = i + one_packet % ver
 
-      if (bitstore % ibeg + 6 > bitstore % iend) exit
+      if (bitstore % ibeg + 7 > bitstore % iend) exit
 
     enddo
     print *, i
     print *, 'remain in store = ', bitstore%iend - bitstore%ibeg+1
     print *, 'number of unique packets ', size(packets)
+
+    call findsubpackets(1, packets, i, j)
+    call evalsubpackets(1, packets, val)
+    call printsubpackets(packets)
+    print *, 'Value of 1 =', val
 
 end program check
